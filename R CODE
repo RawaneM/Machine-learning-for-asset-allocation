@@ -1,0 +1,243 @@
+---
+title: "Statistical Learning project"
+output: 
+  html_notebook:
+    theme: default 
+    toc: true
+    number_sections: true
+    toc_float: 
+      collapsed: false
+---
+```{r}
+if(!require(tidyverse)){install.packages("tidyverse")}
+if(!require(randomForest)){install.packages("randomForest")}
+if(!require(rpart)){install.packages("rpart")}
+if(!require(rpart.plot)){install.packages("rpart.plot")}
+if(!require(xgboost)){install.packages("xgboost")}  
+if(!require(xts)){install.packages("xts")}
+if(!require(highcharter)){install.packages("highcharter")} 
+library(highcharter)
+library(xgboost) 
+library(tidyverse)
+library(rpart)            
+library(rpart.plot) 
+library(randomForest)
+library(xts)
+```
+
+#Data prepocessing 
+```{r}
+#Load the data, compute return and handling NA values
+load("/Users/rawane/Downloads/data_full.RData")# load("/Users/rawane/Downloads/EMLYON/MSQF/Statistical Learning /data.RData")
+data <- data  %>% 
+    group_by(Tick) %>%                          
+    mutate(Return = lead(Close / lag(Close) - 1)) %>%   
+    na.omit() %>%                                          
+    ungroup()
+
+# normalising the data set
+normalise <-  function(v){v <- v %>% as.matrix()   # This is a function that 'uniformalises' a vector
+    return(ecdf(v)(v))}
+
+new_data <- data %>%
+    select(-Close) %>%                     
+    group_by(Date) %>%                    
+    mutate_if(is.numeric, normalise) %>%  
+    ungroup()            
+new_data$Return <- data$Return    
+
+features <- c("Mkt_Cap", "P2B", "Vol_1M", "Div_yield", "PE_ratio", "RSI_1M","D2E", "Prof_growth", "Ret_Cap", "Asset_growth", "Prof_Marg")
+tick <- levels(data$Tick)
+test <- new_data[1,]      # Test sample (in sample, though) 
+
+```
+
+# Weight function with different strategies 
+## 1 = Benchmark, it is an equally weighted portfolio
+## 2 - Boosted trees using classification tasks
+## 3 - Simple trees using classification tasks
+## 4 - Random forest 
+## 5 - A particular case of the penalised predictive regression
+```{r}
+sep_date <- as.Date("2012-01-01")             # This date separates in-sample vs out-of-sample
+t_oos <- data$Date[data$Date > sep_date] %>%  # Out-of-sample dates (i.e., testing set)
+    unique() %>%
+    as.Date(origin = "1970-01-01")
+Tt <- length(t_oos) - 1                                         # Nb of dates, avoid T = TRUE
+nb_port <- 5                                                    # Nb of portfolios
+portf_weights <- array(0, dim = c(Tt, nb_port, length(tick)))   # Store weights
+portf_returns <- matrix(0, nrow = Tt, ncol = nb_port)           # Store returns
+
+weights_multi <- function(train_data, test_data, j){
+    N <- test_data$Tick %>% levels() %>% length() # Number of stocks
+    features <- c("Mkt_Cap", "P2B", "Vol_1M", "Div_yield", "PE_ratio", "RSI_1M","D2E", "Prof_growth", "Ret_Cap",
+                              "Asset_growth", "Prof_Marg")
+    if(j == 1){                             # j = 1 => EW
+        return(rep(1/N,N))
+    }
+    if(j == 2){                             # j = 2 => tree-based
+        # Below, we quickly format the data
+        train_features <- train_data %>% select(features) %>% as.matrix()       # Indep. variable
+        train_label <- train_data$Return                                      # Dependent variable
+        train_matrix <- xgb.DMatrix(data = train_features, label = train_label) # XGB format
+        fit <- train_matrix %>%
+            xgb.train(data = .,                       # Data source (pipe input)
+                      eta = 0.5,                      # Learning rate
+                      objective = "reg:linear",       # Number of random trees
+                      max_depth = 4,                  # Maximum depth of trees
+                      nrounds = 10                    # Number of trees used
+            )
+        xgb_test <- test_data %>%                     # Test sample => XGB format
+            select(features) %>%
+            as.matrix() %>%
+            xgb.DMatrix
+
+        pred <- predict(fit, xgb_test)                # Single prediction
+        return((pred>quantile(pred, 1-1/3))/10)       # Ten largest values, equally-weighted
+    }
+    if (j == 3) {
+        data_c <- train_data %>% mutate(FC_Return = Return > 0)   # Binary categories: + vs - returns
+        fit_simpletrees <- rpart(FC_Return ~ . - Tick - Date - Return,    # The model: remove the irrelevant variables
+             method = "class",                          # Classificartion task
+             data = data_c,                             # Data source
+             cp = 0.001,                                # Complexity
+             maxdepth = 4                               # Maximum number of levels
+        )
+        Simple_treeclass_pred <- predict(fit_simpletrees, test_data) 
+        return((Simple_treeclass_pred[,2]>quantile(Simple_treeclass_pred[,2], 1-1/3))/10)
+    }
+    if (j == 4) {
+        fit_randomforest <- train_data %>%                 # Normalised data
+        select(-Tick, -Date) %>%      # Take out non predictive variables
+        randomForest(Return~.,      # Same formula as for simple trees!
+                     data = .,        # Data source (pipe input)
+                     ntree = 10,      # Number of random trees
+                     mtry = 4         # Number of predictive variables used for each tree
+                    )
+        Random_forest_pred <- predict(fit_randomforest, test_data) # Prediction
+        return((Random_forest_pred>quantile(Random_forest_pred, 1-1/3))/10)
+    }
+
+    if(j == 5){ # j = 1 => regression-based
+        fit <- lm(Return ~ ., data = train_data)   # Training on past data
+        pred <- predict(fit, test_data)             # Prediction
+        w <- pred > mean(pred)                      # Investment decision: TRUE  = 1
+        return(w / sum(w))
+    }
+}
+```
+
+# Backtesting with dynamic allocation
+```{r}
+for(t in 1:(length(t_oos)-1)){                          # Stop before the last date: no fwd return!
+    if(t%%12==0){print(t_oos[t])}                       # Just checking the date status
+    train_data <- new_data %>% filter(Date < t_oos[t])    # Expanding window: all past values!!!
+    test_data <- new_data %>% filter(Date == t_oos[t])    # Current values
+    for(j in 1:nb_port){                                     
+        portf_weights[t,j,] <- weights_multi(train_data, test_data, j)  # Hard-coded params, beware!
+        realized_returns <- data %>%                    # Computing returns via:
+            filter(Date ==  t_oos[t]) %>%               # Filtering
+            select(Return)                            # Selecting
+        portf_returns[t,j] <- sum(portf_weights[t,j,] * realized_returns)
+    }
+}
+Timeline <- t_oos[2:76]
+return_portfolio <- apply(portf_returns,2,cumsum)
+
+Benchmark<-return_portfolio[,1];Boosted_Trees<-return_portfolio[,2];Simple_Trees<-return_portfolio[,3] ; 
+Random_Forest<-return_portfolio[,4] ;Penalised_Regression<-return_portfolio[,5]
+
+ggplot(data.frame(return_portfolio, Timeline), aes(x = Timeline))  + geom_line(aes(y = Benchmark, colour = "Benchmark")) +
+      geom_line(aes(y = Boosted_Trees, colour = "Boosted_Trees")) + geom_line(aes(y = Simple_Trees, colour = "Simple_Trees")) +
+      geom_line(aes(y = Random_Forest, colour = "Random_Forest")) + 
+      geom_line(aes(y = Penalised_Regression, colour = "Penalised_Regression")) +
+      ggtitle("Portfolios Return") + theme(plot.title = element_text(
+      color = "black",
+      size = 14,
+      face = "bold",
+      hjust = 0.5
+      )) +
+      labs(x = 'Timeline', y = "Strategies return") 
+
+Time_Series = as.xts(cbind.data.frame(Benchmark, Boosted_Trees, Simple_Trees,Random_Forest,Penalised_Regression,row.names = Timeline))
+highchart(type = "stock") %>%
+  hc_title(text = "Evolution of the 4 Portfolios compared to the Benchmark") %>%
+  hc_add_series(Time_Series$Benchmark, type = "line", name = "Benchmark") %>%
+  hc_add_series(Time_Series$Boosted_Trees, type ="line", name = "Boosted_Trees") %>%
+  hc_add_series(Time_Series$Simple_Trees, type ="line", name = "Simple_Trees") %>%
+  hc_add_series(Time_Series$Random_Forest, type ="line", name = "Random_Forest") %>%
+  hc_add_series(Time_Series$Penalised_Regression, type ="line", name = "Penalised_Regression") %>%
+  hc_legend(align = "left", verticalAlign = "top",
+            layout = "vertical", x = 0, y = 100)
+
+
+
+t.test(return_portfolio[,2]-return_portfolio[,1])                 # t-test
+```
+
+# Computation of relevant metrics
+```{r}
+perf_met <- function(returns){
+    avg_ret <- mean(returns, na.rm = T)                     # Arithmetic mean 
+    vol <- sd(returns, na.rm = T)                           # Volatility
+    Sharpe_ratio <- avg_ret / vol                           # Sharpe ratio
+    VaR_5 <- quantile(returns, 0.05)                        # Value-at-risk
+    met <- data.frame(avg_ret, vol, Sharpe_ratio, VaR_5)    # Aggregation of all of this
+    rownames(met) <- "Performance metrics"
+    return(met)
+}
+apply(portf_returns,2,perf_met) %>%                     # Taking perf metrics
+      unlist() %>%                                        # Flattening the list
+      matrix(nrow = 5, byrow = 1) %>%                     # Ordering them
+      `colnames<-`(c("avg_ret", "vol", "SR", "VaR")) %>%  # Adding column names
+      `rownames<-`(c('Equally Weighted','Boosted Trees','Simple Trees','Random Forest','Penalised_Regression'))
+      data.frame() 
+      
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
